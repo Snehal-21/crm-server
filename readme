@@ -1,0 +1,497 @@
+# CRM+ Backend
+
+> **Node.js · Express.js · MongoDB · Socket.IO · JWT Auth · RBAC**
+
+REST API server for the CRM+ Lead Management System with real-time notifications.
+
+---
+
+## 📋 Table of Contents
+
+1. [Prerequisites](#prerequisites)
+2. [Installation](#installation)
+3. [Environment Variables](#environment-variables)
+4. [How to Run](#how-to-run)
+5. [Seed Sample Data](#seed-sample-data)
+6. [Project Structure](#project-structure)
+7. [RBAC Design](#rbac-design)
+8. [API Documentation](#api-documentation)
+9. [Real-time Notifications](#real-time-notifications)
+10. [MongoDB Indexes](#mongodb-indexes)
+11. [Design Decisions](#design-decisions)
+
+---
+
+## Prerequisites
+
+- Node.js v16+
+- MongoDB v5+ (local) or a MongoDB Atlas URI
+- npm v8+
+
+---
+
+## Installation
+
+```bash
+cd backend
+npm install
+cp .env.example .env
+# Edit .env with your values
+```
+
+---
+
+## Environment Variables
+
+Copy `.env.example` to `.env` and fill in the values:
+
+```env
+PORT=5000
+MONGODB_URI=mongodb://localhost:27017/crm_plus
+JWT_SECRET=your_super_secret_jwt_key_change_in_production
+JWT_EXPIRES_IN=7d
+CLIENT_URL=http://localhost:3000
+NODE_ENV=development
+```
+
+| Variable | Description | Required | Default |
+|----------|-------------|----------|---------|
+| `PORT` | Server port | No | `5000` |
+| `MONGODB_URI` | MongoDB connection string | **Yes** | — |
+| `JWT_SECRET` | Secret key for signing JWTs | **Yes** | — |
+| `JWT_EXPIRES_IN` | Token expiry duration | No | `7d` |
+| `CLIENT_URL` | Frontend URL (CORS origin) | No | `http://localhost:3000` |
+| `NODE_ENV` | Runtime environment | No | `development` |
+
+---
+
+## How to Run
+
+```bash
+# Development (auto-reload via nodemon)
+npm run dev
+
+# Production
+npm start
+
+# Seed database
+npm run seed
+```
+
+Server runs on **http://localhost:5000**
+
+---
+
+## Seed Sample Data
+
+```bash
+npm run seed
+```
+
+> ⚠️ This **clears all existing data** before seeding.
+
+Creates the following users and 20 sample leads:
+
+| Email | Password | Role |
+|-------|----------|------|
+| admin@crm.com | password123 | admin |
+| manager@crm.com | password123 | manager |
+| sales1@crm.com | password123 | sales |
+| sales2@crm.com | password123 | sales |
+
+---
+
+## Project Structure
+
+```
+backend/
+├── config/
+│   ├── db.js                    # MongoDB connection via Mongoose
+│   └── rbac.js                  # Permissions map (role → permission scopes)
+├── controllers/
+│   ├── authController.js        # register, login, logout
+│   ├── leadController.js        # CRUD + stats aggregation
+│   ├── notificationController.js # list, mark-read, mark-all-read
+│   └── userController.js        # list users, update role
+├── middlewares/
+│   ├── auth.js                  # JWT verification — attaches req.user
+│   ├── rbac.js                  # authorize(permission) + restrictTo(...roles)
+│   ├── validate.js              # Input validation (lead fields, registration)
+│   └── errorHandler.js          # Global error handler
+├── models/
+│   ├── Lead.js                  # Lead schema with all indexes defined
+│   ├── Notification.js          # Notification schema
+│   └── User.js                  # User schema with bcrypt pre-save hook
+├── routes/
+│   ├── auth.js                  # /auth/register, /auth/login, /auth/logout
+│   ├── leads.js                 # /leads CRUD + /leads/stats/summary
+│   ├── notifications.js         # /notifications list + mark-read
+│   └── users.js                 # /users list + role update
+├── services/
+│   └── notificationService.js   # Persist to DB + emit via Socket.IO
+├── utils/
+│   └── seed.js                  # Database seeder script
+├── .env.example
+├── package.json
+└── server.js                    # Express app + HTTP server + Socket.IO init
+```
+
+---
+
+## RBAC Design
+
+RBAC is enforced via the `authorize(permission)` middleware. Each route declares the required permission scope — not a role check — keeping permissions decoupled from roles.
+
+```js
+router.get('/',       authenticate, authorize('lead:read'),   getLeads);
+router.post('/',      authenticate, authorize('lead:write'),  createLead);
+router.delete('/:id', authenticate, authorize('lead:delete'), deleteLead);
+```
+
+### Roles
+
+| Role | Description |
+|------|-------------|
+| `admin` | Full access to all resources including user management |
+| `manager` | All leads + dashboard; can assign leads; no user management |
+| `sales` | Own/assigned leads only; no dashboard |
+
+### Permissions Matrix
+
+| Permission | admin | manager | sales |
+|------------|-------|---------|-------|
+| `lead:read` | ✅ All | ✅ All | ✅ Own/assigned only |
+| `lead:write` | ✅ All | ✅ All | ✅ Own/assigned only |
+| `lead:delete` | ✅ Any | ❌ | ✅ Creator only |
+| `user:read` | ✅ | ✅ | ❌ |
+| `user:write` | ✅ | ❌ | ❌ |
+| `dashboard:read` | ✅ | ✅ | ❌ |
+| `notification:read` | ✅ | ✅ | ✅ Own only |
+
+### Ownership Rules (enforced in controllers)
+
+A **sales** user can access a lead only if:
+- `createdBy === userId` — they created the lead, **OR**
+- `assignedTo === userId` — the lead is assigned to them
+
+**Manager/Admin** can access all leads without restriction.
+
+---
+
+## API Documentation
+
+**Base URL:** `http://localhost:5000`
+
+Protected routes require:
+```
+Authorization: Bearer <jwt_token>
+```
+
+Error response format:
+```json
+{ "message": "string", "errors": ["optional array"] }
+```
+
+---
+
+### Auth
+
+#### `POST /auth/register`
+
+Register a new user. Defaults to `sales` role.
+
+**Body:**
+```json
+{
+  "name": "John Doe",
+  "email": "john@example.com",
+  "password": "secret123"
+}
+```
+
+**Response `201`:**
+```json
+{
+  "message": "User registered successfully.",
+  "user": { "id": "...", "name": "John Doe", "email": "john@example.com", "role": "sales" }
+}
+```
+
+**Validation errors `400`:**
+- name: 2–100 characters required
+- email: valid format required
+- password: minimum 6 characters
+
+---
+
+#### `POST /auth/login`
+
+> ⚠️ Rate limited: **10 requests per 15 minutes** per IP.
+
+**Body:**
+```json
+{ "email": "admin@crm.com", "password": "password123" }
+```
+
+**Response `200`:**
+```json
+{
+  "token": "<jwt>",
+  "user": { "id": "...", "name": "Admin User", "email": "admin@crm.com", "role": "admin" }
+}
+```
+
+JWT payload includes: `sub` (userId), `role`, `iat`, `exp`
+
+---
+
+#### `POST /auth/logout` 🔒
+
+**Response `200`:**
+```json
+{ "message": "Logged out successfully. Please delete your token on the client." }
+```
+
+---
+
+### Leads
+
+#### `GET /leads` 🔒 `lead:read`
+
+Advanced paginated list using MongoDB `$facet` aggregation (data + total count in one query).
+
+**Query Parameters:**
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `q` | string | Search in name, email, phone (case-insensitive) | — |
+| `status` | enum | `new` \| `contacted` \| `qualified` \| `won` \| `lost` | — |
+| `source` | enum | `website` \| `referral` \| `cold` \| `social` \| `other` | — |
+| `assignedTo` | ObjectId | Filter by assigned user *(manager/admin only)* | — |
+| `createdFrom` | ISO date | Leads created on or after this date | — |
+| `createdTo` | ISO date | Leads created on or before this date | — |
+| `sort` | `field:order` | Fields: `name`, `createdAt`, `updatedAt`, `status`, `source` | `createdAt:desc` |
+| `page` | number | Page number (min: 1) | `1` |
+| `limit` | number | Items per page (max: 100) | `10` |
+
+All filters use **AND logic**. Total always reflects filters.
+
+**Response `200`:**
+```json
+{
+  "data": [ ...leads ],
+  "pagination": { "page": 1, "limit": 10, "total": 45, "totalPages": 5 }
+}
+```
+
+**Edge cases handled:** invalid page/limit values, invalid date format, invalid sort field/order.
+
+---
+
+#### `POST /leads` 🔒 `lead:write`
+
+**Body:**
+```json
+{
+  "name": "Jane Smith",
+  "phone": "+91 98765 43210",
+  "email": "jane@example.com",
+  "source": "website",
+  "status": "new",
+  "notes": "Interested in enterprise plan",
+  "assignedTo": "<userId>"
+}
+```
+
+> `assignedTo` only accepted from manager/admin roles.
+
+**Response `201`:**
+```json
+{ "message": "Lead created successfully.", "lead": { ...populatedLead } }
+```
+
+---
+
+#### `GET /leads/stats/summary` 🔒 `dashboard:read`
+
+Analytics via single `$facet` aggregation pipeline.
+
+**Query Parameters:** `createdFrom`, `createdTo` (optional ISO dates)
+
+**Response `200`:**
+```json
+{
+  "totalLeads": 150,
+  "byStatus": { "new": 45, "contacted": 30, "qualified": 25, "won": 35, "lost": 15 },
+  "bySource": { "website": 80, "referral": 45, "cold": 25, "social": 10, "other": 15 }
+}
+```
+
+> All enum values always present — categories with no data return `0`.
+
+---
+
+#### `GET /leads/:id` 🔒 `lead:read`
+
+**Response `200`:** `{ "lead": { ...populatedLead } }`
+
+Returns `403` if a sales user tries to access a lead they don't own or aren't assigned to.
+
+---
+
+#### `PATCH /leads/:id` 🔒 `lead:write`
+
+Update any combination of fields. Only manager/admin can update `assignedTo`.
+
+**Response `200`:** `{ "message": "Lead updated successfully.", "lead": { ...lead } }`
+
+---
+
+#### `DELETE /leads/:id` 🔒 `lead:delete`
+
+**Response `200`:** `{ "message": "Lead deleted successfully." }`
+
+Sales users can only delete leads they created.
+
+---
+
+### Users
+
+#### `GET /users` 🔒 `user:read` · admin only
+
+**Response `200`:** `{ "users": [ ...users ] }` (passwords excluded)
+
+---
+
+#### `GET /users/me` 🔒
+
+Returns the currently authenticated user.
+
+---
+
+#### `PATCH /users/:id/role` 🔒 `user:write` · admin only
+
+**Body:** `{ "role": "admin" | "manager" | "sales" }`
+
+**Response `200`:** `{ "message": "User role updated successfully.", "user": { ...user } }`
+
+---
+
+### Notifications
+
+#### `GET /notifications` 🔒 `notification:read`
+
+**Query Parameters:** `page` (default 1), `limit` (default 20, max 100)
+
+**Response `200`:**
+```json
+{
+  "data": [ ...notifications ],
+  "unreadCount": 5,
+  "pagination": { "page": 1, "limit": 20, "total": 30, "totalPages": 2 }
+}
+```
+
+---
+
+#### `PATCH /notifications/read-all` 🔒 `notification:read`
+
+Marks all of the current user's notifications as read.
+
+---
+
+#### `PATCH /notifications/:id/read` 🔒 `notification:read`
+
+Marks a single notification as read (recipient-scoped).
+
+---
+
+### HTTP Status Codes
+
+| Code | When returned |
+|------|---------------|
+| `200` | Successful GET / PATCH |
+| `201` | Successful POST |
+| `400` | Validation failure / bad request |
+| `401` | Missing, expired, or invalid JWT |
+| `403` | Valid token but insufficient permissions |
+| `404` | Resource not found |
+| `409` | Email already in use |
+| `429` | Login rate limit exceeded |
+| `500` | Unexpected server error |
+
+---
+
+## Real-time Notifications
+
+Socket.IO shares the same HTTP server as Express (no separate port needed).
+
+### How it works
+
+1. Client connects and authenticates via JWT in the handshake
+2. Server verifies the token and joins the socket to a **user-specific room** (keyed by `userId`)
+3. When a trigger event fires, the notification is:
+   - **Persisted to MongoDB first** — ensures no data loss if the user is offline
+   - **Emitted to the user's room** via `io.to(userId).emit('notification', data)`
+
+### Notification Triggers
+
+| Trigger | Type | Recipients |
+|---------|------|------------|
+| Lead created | `lead_created` | All managers + admins (+ assigned user if set) |
+| Lead assigned/reassigned | `lead_assigned` | The newly assigned user |
+| Lead status changed | `lead_status_changed` | Assigned user + all managers/admins |
+| Lead deleted | `lead_deleted` | All managers + admins |
+
+### Socket Authentication
+
+```js
+// Server-side (server.js)
+io.use((socket, next) => {
+  const token = socket.handshake.auth?.token;
+  const decoded = jwt.verify(token, process.env.JWT_SECRET);
+  socket.userId = decoded.sub;
+  next();
+});
+
+io.on('connection', (socket) => {
+  socket.join(socket.userId); // join personal room
+});
+```
+
+---
+
+## MongoDB Indexes
+
+Defined directly on the Mongoose schemas in `models/Lead.js` and `models/Notification.js`:
+
+```js
+// Lead Collection
+{ createdBy: 1 }                              // ownership lookups for sales RBAC
+{ assignedTo: 1 }                             // assignment lookups + assignedTo filter
+{ status: 1 }                                 // status filter
+{ source: 1 }                                 // source filter
+{ createdAt: -1 }                             // default sort (newest first)
+{ status: 1, source: 1, createdAt: -1 }       // compound — common multi-filter + sort
+{ createdBy: 1, assignedTo: 1, status: 1 }    // compound — RBAC + filter combo
+{ name: 'text', email: 'text', phone: 'text'} // text search across 3 fields
+
+// Notification Collection
+{ recipient: 1, isRead: 1, createdAt: -1 }    // per-user list with unread filter + sort
+```
+
+---
+
+## Design Decisions
+
+1. **`$facet` aggregation for `GET /leads`** — retrieves data AND total count in a single MongoDB round-trip instead of two separate queries.
+
+2. **Secondary `_id` sort** — applied alongside every lead sort to guarantee stable, predictable pagination when sort field values are identical across documents.
+
+3. **Permission-based RBAC (not role-based)** — `authorize('lead:write')` instead of `isAdmin()`. Adding a new role only requires a change in `config/rbac.js`, not in route files.
+
+4. **Notification persistence before emit** — saving to MongoDB before the Socket.IO emit ensures data is not lost if the client is offline or disconnects mid-delivery.
+
+5. **Rate limiting on login** — 10 requests per 15-minute window per IP using `express-rate-limit` to prevent brute-force attacks.
+
+6. **Normalised stats output** — all status and source enum values always appear in the analytics response with a `0` fallback, making frontend rendering predictable without null checks.
